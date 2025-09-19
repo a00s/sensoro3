@@ -7,24 +7,22 @@
 #define SDA_PIN      5
 #define SCL_PIN      6
 #define PIN_AO       2      // GPIO analógico (ESP32-C3)
-#define PIN_BTN_CAL  9      // Botão para calibrar (ex.: BOOT no ESP32-C3)
+#define PIN_BTN_CAL  9      // Botão (BOOT no ESP32-C3)
 
 // ================== SENSOR / ADC ==================
-const float VC_SENSOR  = 5.0f;   // meça e ajuste (ex.: 5.02f)
+const float VC_SENSOR  = 5.0f;
 const float VREF_PIN   = 3.3f;
-const float K_DIV      = 1.0f;   // ligado direto
-
 const int   ADC_BITS   = 12;
 const int   N_SAMPLES  = 16;
 
-// ================== DISPLAY (OLED 72x40 na área útil) ==================
+// ================== DISPLAY (rotacionado 180°) ==================
 const uint8_t OLED_W  = 72;
 const uint8_t OLED_H  = 40;
 int16_t X_OFF = 28;
-int16_t Y_OFF = 24;
+int16_t Y_OFF = 0;
 
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(
-  U8G2_R0, SCL_PIN, SDA_PIN, U8X8_PIN_NONE
+  U8G2_R2, SCL_PIN, SDA_PIN, U8X8_PIN_NONE
 );
 
 struct FontChoice { const uint8_t* font; uint8_t height; };
@@ -37,83 +35,87 @@ FontChoice FONT_CANDIDATES[] = {
   { u8g2_font_5x8_tr,         8 }
 };
 
-// ================== TROCA DE PÁGINA / SNAPSHOT ==================
+// ================== PÁGINAS ==================
 const uint32_t PAGE_MS = 1200;
 uint32_t lastPageFlip  = 0;
 int page = 0;               // 0 = V, 1 = ppb
-float vsens_disp = 0.0f;    // valores congelados
+float vsens_disp = 0.0f;
 float ppb_disp   = 0.0f;
 
-// ================== CALIBRAÇÃO (própria) ==================
+// ================== CALIBRAÇÃO ==================
 Preferences prefs;
-float V_AIR_CLEAN = 0.16f;  // fallback
-float R0_DEN      = 0.0f;   // (VC/Vair) - 1
-const bool FORCE_CAL_AT_BOOT = false; // não recalibra no boot
+float V_AIR_CLEAN = 0.16f;
+float V_REF_OZONE = 0.00f;
+float CONC_AIR    = 30.0f;
+float CONC_OZONE  = 1000.0f;
 
-// Ajuste empírico: ppb ≈ A * (Rs/R0)^B
-const float PPB_A = 200.0f;
-const float PPB_B = 1.25f;
+// Pausa display/ble live durante seleção/calibração/reset
+bool calibActive = false;
 
 // ================== BLE ==================
 #define SERVICE_UUID_O3   "8b2fa2c8-6b2f-4e64-8f6f-8a3b8a4d10a1"
-#define CHAR_UUID_TEXT    "f3e1b8a2-2b3c-4a5d-9e7f-1a2b3c4d5e6f"
+#define CHAR_UUID_TEXT    "f3e1b8a2-2b3c-4a5d-9e7f-1a2b3c4d5e6f" // live
+#define CHAR_UUID_CAL     "9a7c1b2e-88f0-45b1-b3a9-7f0f0c3b1e99" // calib
 
 NimBLEServer*         pServer  = nullptr;
 NimBLEService*        pService = nullptr;
 NimBLECharacteristic* pCharTxt = nullptr;
+NimBLECharacteristic* pCharCal = nullptr;
 NimBLEAdvertising*    pAdv     = nullptr;
 
 volatile bool g_connected = false;
 uint32_t g_lastAdvKick = 0;
 
-// === Callbacks BLE: mantém status e volta a anunciar ao desconectar ===
 class MyServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* s) {
-    g_connected = true;
-  }
+  void onConnect(NimBLEServer* s) { g_connected = true; }
   void onDisconnect(NimBLEServer* s) {
     g_connected = false;
-    NimBLEDevice::startAdvertising(); // tenta anunciar imediatamente
+    NimBLEDevice::startAdvertising();
   }
 };
 
 void bleInit() {
   NimBLEDevice::init("O3 sensor");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
-
   pService = pServer->createService(SERVICE_UUID_O3);
 
   pCharTxt = pService->createCharacteristic(
       CHAR_UUID_TEXT,
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
   );
-  // Descriptor 0x2902 (CCCD) ajuda alguns apps a habilitar "Notify"
   pCharTxt->createDescriptor("2902");
-
   pCharTxt->setValue("V=0.00,P=0.0");
-  pService->start();
 
+  pCharCal = pService->createCharacteristic(
+      CHAR_UUID_CAL,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+  pCharCal->createDescriptor("2902");
+  pCharCal->setValue("AIR=0.000,O3=0.000");
+
+  pService->start();
   pAdv = NimBLEDevice::getAdvertising();
   pAdv->addServiceUUID(SERVICE_UUID_O3);
   NimBLEDevice::startAdvertising();
   g_lastAdvKick = millis();
 }
 
-// Atualiza SEMPRE o valor (READ pega o último) e pede notify (se inscrito, recebe)
-void bleUpdate(float vsens_live, float ppb_live) {
-  char buf[20];
-  int n = snprintf(buf, sizeof(buf), "V=%.2f,P=%.1f", vsens_live, ppb_live);
-  if (n < 0) return;
-  if (n >= (int)sizeof(buf)) buf[sizeof(buf)-1] = '\0';
-
+void bleUpdateLive(float vsens_live, float ppb_live) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "V=%.2f,P=%.1f", vsens_live, ppb_live);
   pCharTxt->setValue((uint8_t*)buf, strlen(buf));
-  pCharTxt->notify(); // se não houver assinante, a stack ignora
+  pCharTxt->notify();
 }
 
-// “Kick” periódico no advertising caso algo pare de anunciar
+void bleUpdateCal() {
+  char buf[40];
+  snprintf(buf, sizeof(buf), "AIR=%.3f,O3=%.3f", V_AIR_CLEAN, V_REF_OZONE);
+  pCharCal->setValue((uint8_t*)buf, strlen(buf));
+  pCharCal->notify();
+}
+
 void bleTick(uint32_t now) {
   if (!g_connected && (now - g_lastAdvKick >= 3000)) {
     NimBLEDevice::startAdvertising();
@@ -161,81 +163,152 @@ int readAdcAveraged() {
 
 float readVsens() {
   int raw = readAdcAveraged();
-  float v_pin  = (raw / float((1 << ADC_BITS) - 1)) * VREF_PIN;
-  float v_sens = v_pin * K_DIV;  // Vsens antes do divisor (se houver)
-  return v_sens;
+  return (raw / float((1 << ADC_BITS) - 1)) * VREF_PIN;
 }
 
-// ===== Calibração em ar limpo (média de janela), salva em NVS =====
-void doCalibrateCleanAir(uint16_t ms_window = 5000) {
-  u8g2.clearBuffer(); drawBigCenteredText("CAL"); u8g2.sendBuffer();
-
-  const uint32_t t0 = millis();
-  double acc = 0.0; uint32_t n = 0;
-  while (millis() - t0 < ms_window) {
-    acc += readVsens();
-    n++;
-    delay(10);
-  }
-  if (n == 0) n = 1;
-  V_AIR_CLEAN = (float)(acc / n);
-  R0_DEN      = (VC_SENSOR / fmaxf(V_AIR_CLEAN, 1e-4f)) - 1.0f;
-
+// ================== CALIBRAÇÕES ==================
+void saveCal() {
   prefs.begin("o3cal", false);
   prefs.putFloat("vair", V_AIR_CLEAN);
-  prefs.putFloat("r0den", R0_DEN);
+  prefs.putFloat("voz", V_REF_OZONE);
   prefs.putBool("has", true);
   prefs.end();
+  bleUpdateCal();
+}
 
-  u8g2.clearBuffer(); drawBigCenteredText("OK"); u8g2.sendBuffer();
+void doCalibrateCleanAir(uint16_t ms_window = 5000) {
+  calibActive = true;
+  u8g2.clearBuffer(); drawBigCenteredText("CAL AIR"); u8g2.sendBuffer();
+  const uint32_t t0 = millis();
+  double acc = 0.0; uint32_t n = 0;
+  while (millis() - t0 < ms_window) { acc += readVsens(); n++; delay(10); }
+  V_AIR_CLEAN = (n > 0) ? (float)(acc / n) : 0.2f;
+  saveCal();
+  u8g2.clearBuffer(); drawBigCenteredText("OK AIR"); u8g2.sendBuffer();
   delay(500);
+  calibActive = false;
 }
 
-// ===== Vsens -> Rs/R0 -> ppb =====
+void doCalibrateOzone(uint16_t ms_window = 5000) {
+  calibActive = true;
+  u8g2.clearBuffer(); drawBigCenteredText("CAL O3"); u8g2.sendBuffer();
+  const uint32_t t0 = millis();
+  double acc = 0.0; uint32_t n = 0;
+  while (millis() - t0 < ms_window) { acc += readVsens(); n++; delay(10); }
+  V_REF_OZONE = (n > 0) ? (float)(acc / n) : 0.05f;
+  saveCal();
+  u8g2.clearBuffer(); drawBigCenteredText("OK O3"); u8g2.sendBuffer();
+  delay(500);
+  calibActive = false;
+}
+
+void doResetOzoneCal() {
+  V_REF_OZONE = 0.0f;
+  saveCal();
+  u8g2.clearBuffer(); drawBigCenteredText("O3=0 OK"); u8g2.sendBuffer();
+  delay(700);
+  calibActive = false;
+}
+
+// ================== CONVERSÃO ==================
 float vsens_to_ppb(float vsens) {
-  const float EPS = 1e-4f;
-  if (R0_DEN <= 0.0f) R0_DEN = (VC_SENSOR / fmaxf(V_AIR_CLEAN, EPS)) - 1.0f;
-  float num   = (VC_SENSOR / fmaxf(vsens, EPS)) - 1.0f;
-  float rsr0  = num / fmaxf(R0_DEN, EPS);
-  if (rsr0 < 1.0f) rsr0 = 1.0f;
-  return PPB_A * powf(rsr0, PPB_B);
+  const float EPS = 1e-6f;
+  float v0 = fmaxf(V_AIR_CLEAN, EPS);
+  float v1 = fmaxf(V_REF_OZONE, EPS);
+  float v  = fmaxf(vsens, EPS);
+
+  if (V_REF_OZONE <= 0.0f || fabsf(v1 - v0) < 1e-6f) {
+    float ratio = v0 / v;
+    if (ratio < 1.0f) ratio = 1.0f;
+    return 200.0f * powf(ratio, 1.25f);
+  }
+
+  float logC0 = logf(CONC_AIR);
+  float logC1 = logf(CONC_OZONE);
+  float logV0 = logf(v0);
+  float logV1 = logf(v1);
+  float logV  = logf(v);
+
+  float slope = (logC1 - logC0) / (logV1 - logV0);
+  float logC  = logC0 + slope * (logV - logV0);
+  return expf(logC);
 }
 
-// ===== Páginas =====
-void drawPageVsens(float v_sens_snap) {
-  u8g2.clearBuffer();
-  drawBigCenteredText(fmt_compacto(v_sens_snap) + " V");
-  u8g2.sendBuffer();
-}
-void drawPagePPB(float ppb_snap) {
-  u8g2.clearBuffer();
-  drawBigCenteredText(fmt_compacto(ppb_snap)); // sem "ppb" para caber grande
-  u8g2.sendBuffer();
-}
+// ================== BOTÃO (FSM) ==================
+const uint16_t TRESH_O3         = 2000;   // 2s  -> O3
+const uint16_t TRESH_AIR        = 5000;   // 5s  -> AIR
+const uint16_t AIR_ABORT        = 8000;   // >8s -> ABORT (calibração)
+const uint16_t RESET_O3_HOLD    = 12000;  // 12s -> entra em confirmação O3=0
+const uint16_t RESET_CONFIRM_MS = 3000;   // soltar até 3s para confirmar
 
-// ===== Botão (long-press) =====
-const uint16_t CAL_LONG_MS = 2000;
-bool     btnCalConsumed = false;
-uint32_t btnCalDownAt   = 0;
+enum BtnState { IDLE, SELECT, RESET_CONFIRM };
+BtnState btnState = IDLE;
+
+bool     btnPrev      = false;
+uint32_t pressStartAt = 0;
+uint32_t resetStartAt = 0;
+
+inline bool isPressed() { return digitalRead(PIN_BTN_CAL) == LOW; }
 
 void handleCalButton(uint32_t now) {
-  bool pressed = (digitalRead(PIN_BTN_CAL) == LOW); // INPUT_PULLUP
+  bool pressed = isPressed();
 
-  if (pressed) {
-    if (btnCalDownAt == 0) {
-      btnCalDownAt = now;
-      btnCalConsumed = false;
-    } else if (!btnCalConsumed && (now - btnCalDownAt >= CAL_LONG_MS)) {
-      doCalibrateCleanAir(5000);
-      float v0 = readVsens();
-      vsens_disp = v0;
-      ppb_disp   = vsens_to_ppb(v0);
-      btnCalConsumed = true;
-    }
-  } else {
-    btnCalDownAt = 0;
-    btnCalConsumed = false;
+  // borda de descida
+  if (pressed && !btnPrev) {
+    pressStartAt = now;
+    calibActive  = true;   // pausa telas/ble live
+    btnState     = SELECT;
   }
+
+  if (pressed && btnState == SELECT) {
+    uint32_t held = now - pressStartAt;
+    if (held >= TRESH_O3 && held < TRESH_AIR) {
+      u8g2.clearBuffer(); drawBigCenteredText("O3");  u8g2.sendBuffer();
+    } else if (held >= TRESH_AIR && held < AIR_ABORT) {
+      u8g2.clearBuffer(); drawBigCenteredText("AIR"); u8g2.sendBuffer();
+    } else if (held >= AIR_ABORT && held < RESET_O3_HOLD) {
+      u8g2.clearBuffer(); drawBigCenteredText("ABORT"); u8g2.sendBuffer();
+    } else if (held >= RESET_O3_HOLD) {
+      // entra no modo de confirmação de reset
+      btnState     = RESET_CONFIRM;
+      resetStartAt = now;
+      u8g2.clearBuffer(); drawBigCenteredText("O3=0"); u8g2.sendBuffer();
+    }
+  }
+
+  if (pressed && btnState == RESET_CONFIRM) {
+    // mantendo pressionado na confirmação: se passar de 3s, aborta o reset
+    if ((now - resetStartAt) > RESET_CONFIRM_MS) {
+      u8g2.clearBuffer(); drawBigCenteredText("ABORT"); u8g2.sendBuffer();
+      // volta para SELECT mas sem executar nada; aguarda soltar
+    }
+  }
+
+  // borda de subida (soltou)
+  if (!pressed && btnPrev) {
+    if (btnState == RESET_CONFIRM) {
+      // confirma reset se soltou dentro da janela
+      if ((now - resetStartAt) <= RESET_CONFIRM_MS) {
+        doResetOzoneCal();
+      } else {
+        calibActive = false; // abortou reset
+      }
+    } else if (btnState == SELECT) {
+      uint32_t held = now - pressStartAt;
+      if (held >= TRESH_O3 && held < TRESH_AIR) {
+        doCalibrateOzone(5000);
+      } else if (held >= TRESH_AIR && held < AIR_ABORT) {
+        doCalibrateCleanAir(5000);
+      } else {
+        // soltou em ABORT ou antes de 2s: não faz nada
+        calibActive = false;
+      }
+    }
+    // reset estado
+    btnState = IDLE;
+  }
+
+  btnPrev = pressed;
 }
 
 // ================== SETUP / LOOP ==================
@@ -245,26 +318,19 @@ void setup() {
   u8g2.setContrast(255);
 
   pinMode(PIN_BTN_CAL, INPUT_PULLUP);
-
   analogReadResolution(ADC_BITS);
   analogSetPinAttenuation(PIN_AO, ADC_11db);
 
   bleInit();
 
-  // Carrega calibração se existir
   prefs.begin("o3cal", true);
   bool has = prefs.getBool("has", false);
   if (has) {
     V_AIR_CLEAN = prefs.getFloat("vair", V_AIR_CLEAN);
-    R0_DEN      = prefs.getFloat("r0den", 0.0f);
+    V_REF_OZONE = prefs.getFloat("voz", V_REF_OZONE);
   }
   prefs.end();
-
-  if (FORCE_CAL_AT_BOOT || !has) {
-    doCalibrateCleanAir(5000);
-  } else if (R0_DEN <= 0.0f) {
-    R0_DEN = (VC_SENSOR / fmaxf(V_AIR_CLEAN, 1e-4f)) - 1.0f;
-  }
+  bleUpdateCal();
 
   float v0 = readVsens();
   vsens_disp = v0;
@@ -274,34 +340,31 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // Leituras "ao vivo"
   float v_sens = readVsens();
   float ppb    = vsens_to_ppb(v_sens);
 
-  // Botão de calibração (long-press)
   handleCalButton(now);
 
-  // Troca de página + snapshot na troca
-  if (now - lastPageFlip >= PAGE_MS) {
-    lastPageFlip = now;
-    page ^= 1;
-    if (page == 0) vsens_disp = v_sens;
-    else           ppb_disp   = ppb;
+  if (!calibActive) {
+    if (now - lastPageFlip >= PAGE_MS) {
+      lastPageFlip = now;
+      page ^= 1;
+      if (page == 0) vsens_disp = v_sens;
+      else           ppb_disp   = ppb;
+    }
+
+    u8g2.clearBuffer();
+    if (page == 0) drawBigCenteredText(String(vsens_disp, 2) + " V");
+    else           drawBigCenteredText(fmt_compacto(ppb_disp));
+    u8g2.sendBuffer();
+
+    static uint32_t lastBle = 0;
+    if (now - lastBle >= 1000) {
+      lastBle = now;
+      bleUpdateLive(v_sens, ppb);
+    }
   }
 
-  // Render congelado
-  if (page == 0) drawPageVsens(vsens_disp);
-  else           drawPagePPB(ppb_disp);
-
-  // BLE: atualiza valor e notifica a cada 1 s
-  static uint32_t lastBle = 0;
-  if (now - lastBle >= 1000) {
-    lastBle = now;
-    bleUpdate(v_sens, ppb);
-  }
-
-  // Mantém advertising vivo caso desconecte e a stack pare de anunciar
   bleTick(now);
-
   delay(60);
 }
